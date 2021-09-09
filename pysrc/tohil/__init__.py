@@ -294,6 +294,7 @@ from tohil._tohil import (
     incr,
     result,
     register_callback,
+    alias,
     __version__,
 )
 

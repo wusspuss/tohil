@@ -4426,6 +4426,8 @@ static PyMethodDef TohilMethods[] = {
     {"result", (PyCFunction)tohil_result, METH_VARARGS | METH_KEYWORDS, "return the tcl interpreter result object"},
     {"register_callback", (PyCFunction)tohil_register_callback, METH_VARARGS | METH_KEYWORDS,
      "Register a Python callable so it can be called directly from Tcl as a command"},
+    {"alias", (PyCFunction)tohil_register_callback, METH_VARARGS | METH_KEYWORDS,
+     "Create a Tcl command that will directly invoke a corresponding Python callable"},
     {NULL, NULL, 0, NULL} /* Sentinel */
 };
 
