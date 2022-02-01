@@ -40,14 +40,14 @@ def handle_exception(exception_type, val, traceback_object=None):
     """handle_exception - the tohil C code that handles uncaught
     python exceptions invokes this to turn an exception type, value
     and traceback object into a tcl error code and error info"""
-    error_code = ["PYTHON", exception_type.__name__, val]
+    error_code = ["PYTHON", exception_type.__name__, str(val)]
 
     if traceback_object is None:
         error_info = "\nfrom python code executed by tohil"
     else:
         tb_list = _traceback.format_tb(traceback_object)
         error_info = "\nfrom python code executed by tohil\n" + " ".join(tb_list).rstrip()
-    return error_code, error_info
+    return list(error_code), str(error_info)
 
 
 def run(command):

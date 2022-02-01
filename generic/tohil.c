@@ -776,7 +776,7 @@ Tohil_ReturnExceptionToTcl(Tcl_Interp *interp, PyThreadState *prior, char *descr
     if (PyErr_Occurred() == NULL) {
         return Tohil_ReturnTclError(interp, prior, "bug in tohil - Tohil_ReturnExceptionToTcl called without a python error having occurred");
     }
-
+    
     // break out the exception
     PyObject *pType = NULL, *pVal = NULL, *pTrace = NULL;
 
@@ -786,8 +786,9 @@ Tohil_ReturnExceptionToTcl(Tcl_Interp *interp, PyThreadState *prior, char *descr
     // PyObject_Print(pVal, stdout, 0);
 
     // set tcl interpreter result
-    Tcl_SetObjResult(interp, pyObjToTcl(interp, pVal));
-
+    PyObject * str = PyObject_Str(pVal);
+    Tcl_SetObjResult(interp, pyObjToTcl(interp, str));
+    Py_DECREF(str);
     Tcl_AddErrorInfo(interp, " (");
     Tcl_AddErrorInfo(interp, description);
     Tcl_AddErrorInfo(interp, ")");
