@@ -79,7 +79,7 @@ static PyObject *tohil_python_return(Tcl_Interp *, int tcl_result, PyObject *toT
 static int tohil_mod_exec(PyObject *m);
 
 static PyObject *TohilTclObj_FromTclObj(Tcl_Interp *interp, Tcl_Obj *obj);
-
+static int Tohil_Path(Tcl_Interp * interp, PyObject * pObj, int objc, Tcl_Obj *const objv[]);
 typedef struct {
     Tcl_Interp *interp;
 } TohilModuleState;
@@ -87,6 +87,48 @@ typedef struct {
 #define tohilstate(o) ((TohilModuleState *)PyModule_GetState(o))
 
 // TCL library begins here
+typedef struct {PyObject * pObj;} TohilObjCmdData;
+
+static int tohil_pyobjcmd_cmd(ClientData cdata, Tcl_Interp *interp, int objc,
+                              Tcl_Obj *const objv[]) {
+    TohilObjCmdData * data=(TohilObjCmdData*)cdata;
+    Tohil_Path(interp,data->pObj,objc-1,&objv[1]);
+    return TCL_OK;
+}
+
+static void tohil_pyobjcmd_destroy(ClientData cdata) {
+    TohilObjCmdData * data=(TohilObjCmdData*)cdata;
+    Py_DECREF(data->pObj);
+    free(cdata);
+    
+};
+
+static int tohil_pyobjcmd_name(Tcl_Interp *interp, PyObject * pObj) {
+    PyObject * pId = PyLong_FromVoidPtr(pObj);
+    PyObject * pStr = PyObject_Str(pId);
+    PyObject * pBytes = PyUnicode_AsUTF8String(pStr);
+    const char * idStr= PyBytes_AS_STRING(pBytes);
+    Tcl_SetObjResult(interp,
+                     Tcl_ObjPrintf("tohil_obj%s", idStr)); 
+    Py_DECREF(pId);
+    Py_DECREF(pStr);
+    Py_DECREF(pBytes);
+    return TCL_OK;
+}
+
+
+static int tohil_pyobjcmd_new(Tcl_Interp *interp, PyObject * pObj) {
+    tohil_pyobjcmd_name(interp,pObj);
+    
+    const char * cmdName = Tcl_GetStringResult(interp);
+    TohilObjCmdData * cdata = malloc(sizeof(TohilObjCmdData));
+    cdata->pObj = pObj;
+    Tcl_CreateObjCommand(interp,cmdName,tohil_pyobjcmd_cmd,
+                         cdata,
+                         tohil_pyobjcmd_destroy
+                         );
+    return TCL_OK;
+}
 
 #define TOHIL_NONE_SENTINEL "tohil::NONE"
 
@@ -645,21 +687,11 @@ _pyObjToTcl(Tcl_Interp *interp, PyObject *pObj)
             return NULL;
         }
     } else {
-        /* Get python string representation of other objects */
-        pStrObj = PyObject_Str(pObj);
-        if (pStrObj == NULL)
-            return NULL;
-        pBytesObj = PyUnicode_AsUTF8String(pStrObj);
-        Py_DECREF(pStrObj);
-        if (pBytesObj == NULL)
-            return NULL;
-        if (tohil_UTF8ToTcl(interp, PyBytes_AS_STRING(pBytesObj), PyBytes_GET_SIZE(pBytesObj), &utf8string, &utf8len) != TCL_OK) {
-            Py_DECREF(pBytesObj);
-            return NULL;
-        }
-        tObj = Tcl_NewStringObj(utf8string, utf8len);
-        ckfree(utf8string);
-        Py_DECREF(pBytesObj);
+        /* Create command for other objects */
+        if (tohil_pyobjcmd_new(interp,pObj)!=TCL_OK)
+            tObj=NULL;
+        else
+            tObj=Tcl_GetObjResult(interp);
     }
 
     return tObj;
@@ -960,6 +992,246 @@ tohil_setup_subinterp(Tcl_Interp *interp, enum SubinterpType subtype)
         break;
     }
     return parent;
+}
+enum conv {conv_unknown=-1,conv_int,conv_str,conv_objcmd};
+enum conv conv_from_str(Tcl_Interp * interp, char * str, int len) {
+    if (strncmp(str,"int",len)==0) {
+        return conv_int;
+    }
+    if (strncmp(str,"str",len)==0) {
+        return conv_str;
+    }
+    if (strncmp(str,"objcmd",len)==0) {
+        return conv_objcmd;
+    }
+    Tcl_SetObjResult(interp,
+                     Tcl_ObjPrintf("Unknown type %.*s", len, str));
+    return conv_unknown;
+}
+static PyObject * convert_TclObj_to_pObj(Tcl_Interp * interp, Tcl_Obj * obj, enum conv conv) {
+    switch (conv) {
+    case conv_str:
+        int tclStringSize;
+        char *tclString;
+        int utf8len;
+        char *utf8string;
+
+        tclString = Tcl_GetStringFromObj(obj, &tclStringSize);
+        if (tohil_TclToUTF8(interp, tclString, tclStringSize, &utf8string, &utf8len) != TCL_OK) {
+            /* PyErr_SetString(PyExc_RuntimeError, Tcl_GetString(Tcl_GetObjResult(interp))); */
+            return NULL;
+        }
+        PyObject *pObj = Py_BuildValue("s#", utf8string, utf8len);
+        ckfree(utf8string);
+        return pObj;
+    case conv_int:
+        Tcl_WideInt wideValue;
+        if (Tcl_GetWideIntFromObj(interp, obj, &wideValue) == TCL_OK) {
+            return PyLong_FromLongLong(wideValue);
+        }
+        return NULL;
+    case conv_objcmd:
+        char *procname = Tcl_GetStringFromObj(obj, NULL);
+        Tcl_CmdInfo cmdinfo;
+        if (!Tcl_GetCommandInfo(interp, procname, &cmdinfo)) {
+            Tcl_SetObjResult(interp, Tcl_ObjPrintf("No such command: %s",
+                                                   procname));
+            return NULL;
+        }
+        if (cmdinfo.objProc == tohil_pyobjcmd_cmd) {
+            TohilObjCmdData * cdata=(TohilObjCmdData*)cmdinfo.objClientData;
+            return cdata->pObj;
+            return TCL_OK;
+        } else {
+            Tcl_SetObjResult(interp,
+                             Tcl_ObjPrintf("%s is not a tohil objcmd", procname));
+            return NULL;
+        }
+    default:
+        Tcl_SetObjResult(interp,
+                         Tcl_ObjPrintf("Bug in tohil, conversion \
+not implemented: %i", conv));        
+    }
+    return NULL;
+}
+/* objc/objv have to start from the callable's name */
+static int
+TohilCallNew(PyObject *pObjCallable, Tcl_Interp *interp, int objc, Tcl_Obj *const objv[]) {
+    PyThreadState *prior = tohil_swap_subinterp(interp);
+    int obji=1; 
+    int ret=TCL_OK;
+    PyObject *pArgs = PyList_New(0); /*positional args*/
+    PyObject * pArgsTuple=NULL;
+    PyObject *kwArgs = PyDict_New(); /*keyword args*/
+    enum conv pConvs[256]; /*conversions for positional args*/
+    pConvs[0]=conv_unknown; /*conv_unknown = the end*/
+    enum conv conv;
+    int pConvsIdx=0;
+    
+    char * typePtr;
+    char * delim;
+    int strLen;
+    PyObject * pObj;
+    // kwargs
+    for (; obji<objc; obji++) {
+        int argLen;
+        char * argstr=Tcl_GetStringFromObj(objv[obji], &argLen);
+        if (strncmp(argstr, "--", 2)==0) {
+            // ^this signals kwargs' end and may indicate pargs type
+            // we parse parg convs here, we apply them in pargs loop
+            typePtr = argstr+2;
+            delim = typePtr;
+            do {
+                delim = strchr(typePtr, ',');
+                if (!delim) {
+                    delim=strchr(typePtr,'\0');
+                }
+                strLen = delim-typePtr;
+                if (!strLen)
+                    break;
+
+                conv=conv_from_str(interp,typePtr,strLen);
+                if (conv==conv_unknown) {
+                    ret=TCL_ERROR;
+                    goto cleanup;
+                }
+                pConvs[pConvsIdx]=conv;
+                pConvsIdx++;
+                
+                typePtr=delim+1;
+            } while (1);
+            pConvs[pConvsIdx]=conv_unknown;
+            obji++;
+            break;
+        }
+        
+        if (argstr[0] != '-' || objc-obji<2)
+            break; //end of kwargs
+        conv=conv_str;
+        int keyLen;
+        char * keyPtr = Tcl_GetStringFromObj(objv[obji],&keyLen)+1;
+        keyLen--; // the dash
+        typePtr = strchr(keyPtr,':');
+        if (typePtr) {
+            int typeLen=keyLen-(typePtr-keyPtr)-1;
+            keyLen=keyLen-typeLen-1;
+            if (typeLen>0) {
+                typePtr++;
+                conv=conv_from_str(interp,typePtr,typeLen);
+                if (conv==conv_unknown) {
+                    ret=TCL_ERROR;
+                    goto cleanup;
+                }
+            }
+        }
+        
+        obji++;
+        pObj = convert_TclObj_to_pObj(interp,objv[obji],conv);
+        if (!pObj) {
+            ret=TCL_ERROR;
+            goto cleanup;
+        }
+        PyDict_SetItem(kwArgs, Py_BuildValue("s#", keyPtr, keyLen), pObj);
+    }
+    
+    // pargs
+    for (pConvsIdx=0; pConvs[pConvsIdx]!=conv_unknown; pConvsIdx++) {
+        if (obji==objc) {
+            Tcl_SetObjResult(interp,
+                             Tcl_ObjPrintf("More type specifications \
+than positional args"));
+            ret=TCL_ERROR;
+            
+            goto cleanup;
+        }
+        pObj = convert_TclObj_to_pObj(interp,objv[obji],pConvs[pConvsIdx]);
+        if (!pObj) {
+            ret=TCL_ERROR;
+            goto cleanup;
+        }
+        PyList_Append(pArgs, pObj);
+        obji++;
+    }
+    //pargs no conv was specified for
+    for (;obji<objc; obji++) {
+        pObj = convert_TclObj_to_pObj(interp,objv[obji],conv_str);
+        if (!pObj) {
+            ret=TCL_ERROR;
+            goto cleanup;
+        }
+        PyList_Append(pArgs, pObj);
+    }
+
+    // actual call
+    pArgsTuple = PyList_AsTuple(pArgs); 
+    PyObject *pRet = PyObject_Call(pObjCallable, pArgsTuple, kwArgs);
+
+    if (pRet == NULL) {
+        return Tohil_ReturnExceptionToTcl(interp, prior, "error in python object call");
+    }
+
+    Tcl_Obj *tRet = pyObjToTcl(interp, pRet);
+    Py_DECREF(pRet);
+    if (tRet == NULL) {
+        return Tohil_ReturnExceptionToTcl(interp, prior, "error converting python object to tcl object");
+    }
+
+    Tcl_SetObjResult(interp, tRet);
+    return tohil_tcl_return(interp, prior, TCL_OK);
+ cleanup:
+    Py_DECREF(pArgs);
+    Py_XDECREF(pArgsTuple);
+    Py_DECREF(kwArgs);
+    return ret;
+};
+static int Tohil_Path(Tcl_Interp * interp, PyObject * pObj, int objc, Tcl_Obj *const objv[])
+{
+    PyThreadState *prior = tohil_swap_subinterp(interp);
+    PyObject *pObjParent;
+    Py_INCREF(pObj);
+    for (int i=0; i<objc; i++) {
+        if (Tcl_GetString(objv[i])[0]=='-') {
+            // take an additional step back to include callable name
+            return TohilCallNew(pObj,interp, objc-i+1, &objv[i-1]);
+        }
+        pObjParent=pObj;
+        pObj=PyObject_GetAttrString(pObj, Tcl_GetString(objv[i]));
+        Py_DECREF(pObjParent);
+        if (!pObj) {
+            return tohil_tcl_return(interp, prior, TCL_ERROR);
+        }
+    }
+    Tcl_Obj *tRet = pyObjToTcl(interp, pObj);
+    if (tRet == NULL) {
+        return tohil_tcl_return(interp, prior, TCL_ERROR);
+    }
+
+    Tcl_SetObjResult(interp, tRet);
+    
+    return tohil_tcl_return(interp, prior, TCL_OK);   
+}
+
+static int Tohil_Cmd(ClientData clientData, Tcl_Interp *interp, int objc, Tcl_Obj *const objv[])
+{
+    PyThreadState *prior = tohil_swap_subinterp(interp);
+    PyObject *pObj;
+    if (objc < 2) {
+        Tcl_WrongNumArgs(interp, 1, objv, "?-kwlist list? ?-nonevalue word? func ?arg ...?");
+        return tohil_tcl_return(interp, prior, TCL_ERROR);
+    }
+    //first element may be from __main__ or builtins, handle it differently
+    pObj=PyObject_GetAttrString(PyImport_AddModule("__main__"),Tcl_GetString(objv[1]));
+    if (!pObj) {
+      PyErr_Clear(); 
+      pObj = PyDict_GetItemString(PyEval_GetBuiltins(), Tcl_GetString(objv[1]));
+      if (!pObj) {
+        Tcl_SetObjResult(interp, Tcl_ObjPrintf("No python object found: %s", Tcl_GetString(objv[1])));
+        return tohil_tcl_return(interp, prior, TCL_ERROR);
+      }
+    }
+    int ret= Tohil_Path(interp,pObj,objc-2,&objv[2]);
+    Py_DECREF(pObj);
+    return ret;
 }
 
 //
@@ -3970,7 +4242,7 @@ static PyTypeObject TohilTclDictType = {
 // end of tcldict python datatype
 //
 //
-
+/* static PyObject * tohil_python_type_ */
 // tohil_python_return - you call this routine when you have a tcl object
 //   that you want to turn into a python object.  usually you call it when
 //   you are returning from a C function called from python, but it is
@@ -4683,7 +4955,8 @@ Tohil_Init(Tcl_Interp *interp)
 
     if (Tcl_CreateObjCommand(interp, "::tohil::interact", (Tcl_ObjCmdProc *)TohilInteract_Cmd, (ClientData)NULL, (Tcl_CmdDeleteProc *)NULL) == NULL)
         return TCL_ERROR;
-
+    if (Tcl_CreateObjCommand(interp, "tohil", (Tcl_ObjCmdProc *)Tohil_Cmd, (ClientData)NULL, (Tcl_CmdDeleteProc *)NULL) == NULL)
+        return TCL_ERROR;
     return TCL_OK;
 }
 
